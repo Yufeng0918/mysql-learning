@@ -51,20 +51,75 @@ select id, name, age from user where id = 1
 
 ### 2.2 Redo日志
 
-redo日志是为了防止机器宕机，缓存数据数据没有刷入磁盘。redo日志用于恢复数据。
+InnoDB 特有的日志文件。redo日志是为了防止机器宕机，缓存数据数据没有刷入磁盘。redo日志用于恢复数据。
 
 ![](./images/mysql-04.png)
 
-**Innodb_flush_log_at_trx_commit=0**，**提交事务的时候不会redo log 刷入磁盘**。如果提交事务成功而mysql宕机，内存中的数据和redo日志都会丢失
+**Innodb_flush_log_at_trx_commit=0**，**提交事务的时候不会redo log 刷入磁盘**。如果提交事务成功而**mysql宕机**，内存中的数据和redo日志都会丢失
 
 
 
 ![](./images/mysql-05.png)
 
-**Innodb_flush_log_at_trx_commit=1**，**提交事务的时候必须把redo log 刷入磁盘**。如果提交事务成功而mysql宕机，内存中的数据丢失。mysql重启以后可以通过redo日志来恢复数据
-
-
+**Innodb_flush_log_at_trx_commit=1**，**提交事务的时候必须把redo log 刷入磁盘**。如果提交事务成功而**mysql或者机器宕机**，内存中的数据丢失。mysql重启以后可以通过redo日志来恢复数据
 
 ![](./images/mysql-06.png)
 
-**Innodb_flush_log_at_trx_commit=2**，**提交事务的时候必须把redo log 刷os cache**。如果提交事务成功而mysql宕机，内存中的数据丢失。如果os cache没有把数据刷入磁盘，os cache 和 redo日志都会丢失。
+**Innodb_flush_log_at_trx_commit=2**，**提交事务的时候必须把redo log 刷os cache**。如果提交事务成功而**机器宕机**，内存中的数据丢失。如果os cache没有把数据刷入磁盘，os cache 和 redo日志都会丢失。
+
+
+
+### 2.3 Binlog日志
+
+binlog日志属于mysql server的日志文件
+
+![](./images/mysql-07.png)
+
++ 加载数据进入缓冲池
++ 把旧数据写入undo日志
++ 更新内存中的数据
++ 写入redo log buffer
++ 准备提交事务，把redo日志刷入文件
++ 准备提交事务，把binlog日志写入磁盘
+
+![](./images/mysql-08.png)
+
+**sync_binding 设置为0**，binlog日志不直接进入磁盘，而是写入os cache。如果机器宕机，os cache 和 binlog日志会丢失
+
+![](./images/mysql-09.png)
+
+**sync_binding 设置为1**，binlog日志直接进入磁盘，而是写入os cache。如果机器宕机 binlog日志不会丢失
+
+
+
+### 2.4 基于redo日志和binlog完成事务提交
+
+![](./images/mysql-10.png)
+
+事务最终提交。把这次更新对应的binlog文件名和更新的binlog日志文件里的位置写入redo log日志里面。同时在redo log 日志里面写入一个commit
+
+**假如5步骤以后宕机**，没有最终事务的标记在redo日志里面，判定这次事务不成功。
+
+**假如6步骤以后宕机**，redo日志没有commit标记，判定事务提交失败
+
+必须redo日志中有事务commit标记，redo日志和binlog完全一致，才判断事务成功。
+
+![](./images/mysql-11.png)
+
+即使在步骤8，刷入磁盘文件之前宕机了，那么redo日志也会恢复之前事务的提交，IO线程会把已经修改的值放入磁盘数据文件。
+
+
+
+## 3. 案例实战：数据库的配置
+
+**数据库部署的时候常选用的机器配置最低在8核16G以上**，正常在16核32G
+
+一般Java应用系统部署在4核8G的机器上，每秒钟抗下500左右的并发访问量，差不多是比较合适的，当然这个也不一定。因为你得考虑一下，假设你每个请求花费1s可以处理完，那么你一台机器每秒也许只可以处理100个请求，但是如果你每个请求只要花费100ms就可以处理完，那么你一台机器每秒也许就可以处理几百个请求。
+
+
+
+高并发的情况下，对性能要求极高。对于你Java系统接收到的每个请求，**耗时最多的还是发送网络请求到数据库上去，等待数据库执行一些SQL语句，返回结果给你**。所以其实我们常说你有一个Java系统压力很大，负载很高，但是其实你要明白一点，你这个Java系统其实主要的**压力和复杂都是集中在你依赖的那个MySQL数据库上的！**
+
+
+
+因为你执行大量的增删改查的SQL语句的时候，**MySQL数据库需要对内存和磁盘文件进行大量的IO操作**，所以数据库往往是负载最高的！所以往往对一个数据库而言，都是选用8核16G的机器作为起步，最好是选用16核32G的机器更加合适一些，因为数据库需要执行大量的磁盘IO操作，他的每个请求都比较耗时一些，所以机器的配置自然需要高一些了。
