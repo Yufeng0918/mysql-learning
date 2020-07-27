@@ -1,5 +1,7 @@
 
 
+
+
 # MySQL实战高手
 
 
@@ -1005,4 +1007,134 @@ RAID卡一般都配置有自己独立的锂电池或者是电容，如果服务�
 + **给RAID卡把锂电池换成电容**，电容是不用频繁充放电的，不会导致充放电的性能抖动，还有就是电容可以支持透明充放电，就是自动检查电量，自动进行充电，不会说在充放电的时候让写IO直接走磁盘，但是更换电容很麻烦，而且**电容比较容易老化，其实一般不常用**
 + **手动充放电**，这个比较常用，包括一些大家知道的顶尖互联网大厂的数据库服务器的RAID就是**用了这个方案避免性能抖动，就是关闭RAID自动充放电，然后写一个脚本，脚本每隔一段时间自动在晚上凌晨的业务低峰时期**，脚本手动触发充放电，这样可以避免业务高峰期的时候RAID自动充放电引起性能抖动
 + 充放电的时候不要关闭write back，就是设置一下，**锂电池充放电的时候不要把缓存级别从write back修改为write through**，这个也是可以做到的，可以和第二个策略配合起来使用
+
+
+
+## 9. 案例分析：数据库无法连接Too many connections
+
+据库部署在64GB的大内存物理机上，机器配置各方面都很高，然后连接这台物理机的Java系统部署在2台机器上，Java系统设置的连接池的最大大小是200，也就是说每台机器上部署的Java系统，最多跟MySQL数据库建立200个连接，一共最多建立400个连接
+
+![](./images/mysql-40.png)
+
+MySQL报异常说Too many Connections，就说明目前MySQL甚至都无法建立400个网络连接。于是我们检查了一下MySQL的配置文件，my.cnf，里面有一个关键的参数是**max_connections**，就是MySQL能建立的最大连接数，设置的是**800**。
+
+> Could not increase number of max_open_files to more than mysqld (request: 65535)
+> Changed limits: max_connections: 214 (requested 2000)
+> Changed limits: table_open_cache: 400 (requested 4096)
+
+
+
+MySQL发现自己无法设置max_connections为我们期望的800，只能强行限制为214了！这是为什么呢？简单来说，就是因为底层的linux操作系统把进程可以打开的**文件句柄数限制为了1024了，导致MySQL最大连接数是214**！
+
+```bash
+ulimit -HSn 65535
+cat /etc/security/limits.conf
+cat /etc/rc.local
+```
+
+因为如果linux限制你一个进程的文件句柄太少的话，那么就会导致我们没办法创建大量的网络连接，此时我们的系统进程就没法正常工作了
+
+举个例子，比如MySQL运行的时候，其实就是linux上的一个进程，那么他其实是需要跟很多业务系统建立大量的连接的，结果你限制了他的最大文件句柄数量，那么他就不能建立太多连接了！
+
+所以说，往往你在生产环境部署了一个系统，比如**数据库系统、消息中间件系统、存储系统、缓存系统之后，都需要调整一下linux的一些内核参数**，这个文件句柄的数量是一定要调整的，**通常都得设置为65535**
+
+所以我们平时可以用ulimit命令来设置每个进程被限制使用的资源量，用**ulimit -a**就可以看到进程被限制使用的各种资源的量
+
+
+
+## 10. Redo 日志
+
+### 10.1 Redo日志机制
+
+更新完Buffer Pool中的缓存页之后，必须要写一条redo log，这样才能记录下来我们对数据库做的修改。
+
+redo log可以保证我们事务提交之后，如果事务中的增删改SQL语句更新的缓存页还没刷到磁盘上去，此时MySQL宕机了，那么MySQL重启过后，就可以把redo log重做一遍，恢复出来事务当时更新的缓存页，然后再把缓存页刷到磁盘就可以了。redo log本质是保证事务提交之后，修改的数据绝对不会丢失的。
+
+![](./images/mysql-41.png)
+
+redo log机制，这个机制就是说，你提交事务的时候，绝对是保证把你对缓存页做的修改以日志的形式，写入到redo log日志文件里去的。这种日志大致的格式如下：对表空间XX中的数据页XX中的偏移量为XXXX的地方更新了数据XXX。只要你事务提交的时候保证你做的修改以日志形式写入redo log日志，那么哪怕你此时突然宕机了，也没关系！
+
+因为你MySQL重启之后，把你之前事务更新过做的修改根据redo log在Buffer Pool里重做一遍就可以了，就可以恢复出来当时你事务对缓存页做的修改，然后找时机再把缓存页刷入磁盘文件里去。
+
+实际上，**如果你把修改过的缓存页都刷入磁盘，这首先缓存页一个就是16kb，数据比较大**，刷入磁盘比较耗时，而且你可能就修改了缓存页里的几个字节的数据，难道也把完整的缓存页刷入磁盘吗。而且**你缓存页刷入磁盘是随机写磁盘**，性能是很差的
+
+
+
+### 10.2 Redo日志格式
+
+redo log就划分为了不同的类型
+
++ MLOG_1BYTE类型的日志指的就是修改了1个字节的值
++ MLOG_2BYTE类型的日志指的就是修改了2个字节的值，以此类推，还有修改了4个字节的值的日志类型，修改了8个字节的值的日志类型。
++ 修改了一大串的值，类型就是**MLOG_WRITE_STRING**，就是代表你一下子在那个数据页的某个偏移量的位置插入或者修改了一大串的值。
+
+```
+日志类型（就是类似MLOG_1BYTE之类的），表空间ID，数据页号，数据页中的偏移量，具体修改的数据
+```
+
+
+
+### 10.3 Redo Block
+
+MySQL内有另外一个数据结构，叫做**redo log block**，大概你可以理解为，平时我们的数据不是存放在数据页了的么，用一页一页的数据页来存放数据。那么对于redo log也不是单行单行的写入日志文件的，他是用一个redo log block来存放多个单行日志的。
+
+12字节的header头又分为了4个部分。
+
++ 4个字节的**block no**，就是块唯一编号；
++ 2个字节的**data length**，就是block里写入了多少字节数据；
++ 2个字节的**first record group**。这个是说每个事务都会有多个redo log，是一个redo log group，即一组redo log。那么在这个block里的**第一组redo log的偏移量**，就是这2个字节存储的；
++ 4个字节的checkpoint on
+
+![](./images/mysql-43.png)
+
+每一个redo log都是写入到文件里的一个redo log block里去的，**一个block最多放496自己的redo log日志**。
+
+![](./images/mysql-42.png)
+
+一个redo log block就是512字节，那么真正写入的时候，把这个redo log block的512字节的数据，就写入到redo log文件里去就可以了。那么redo log文件里就多了一个block。**日志文件里是存放一个又一个的redo log block的**
+
+
+
+### 10.4 Redo Log Buffer
+
+![](./images/mysql-44.png)
+
+
+
+这个redo log到底是如何通过内存缓冲之后，再进入磁盘文件里去的，这就涉及到了一个新的组件，**redo log buffer，他就是MySQL专门设计了用来缓冲redo log写入的。**
+
+这个redo log buffer其实就是MySQL在启动的时候，就跟操作系统申请的一块**连续内存空间**.
+
+通过设置mysql的**innodb_log_buffer_size**可以指定这个redo log buffer的大小，**默认的值就是16MB**，其实已经够大了，毕竟一个redo log block才512自己而已，每一条redo log其实也就几个字节到几十个字节罢了。
+
+写满了一个redo log block，就会继续写下一个redo log block，以此类推，直到所有的redo log block都写满。**万一要是redo log buffer里所有的redo log block都写满了呢。那此时必然会强制把redo log block刷入到磁盘中去的**！
+
+
+
+其实在我们平时执行一个事务的过程中，每个事务会有多个增删改操作，那么就会有多个redo log，这多个redo log就是一组redo log，其实每次一组redo log都是先在别的地方暂存，然后都执行完了，再把一组redo log给写入到redo log buffer的block里去的
+
+**如果一组redo log实在是太多了，那么就可能会存放在两个redo log block中**
+
+![](./images/mysql-45.png)
+
+**如果说一个redo log group比较小，那么也可能多个redo log group是在一个redo log block里的**
+
+![](./images/mysql-46.png)
+
+
+
+![](./images/mysql-47.png)
+
+**Redo log block是哪些时候会刷入到磁盘文件里去：**
+
++ 如果写入**redo log buffer的日志已经占据了redo log buffer总容量的一半了**，也就是超过了8MB的redo log在缓冲里了，此时就会把他们刷入到磁盘文件里去
++ **一个事务提交的时候**，必须把他的那些redo log所在的redo log block都刷入到磁盘文件里去，只有这样，当事务提交之后，他修改的数据绝对不会丢失，因为redo log里有重做日志，随时可以恢复事务做的修改
++ **后台线程定时刷新**，有一个后台线程每隔1秒就会把redo log buffer里的redo log block刷到磁盘文件里去
++ **MySQL关闭的时候**，redo log block都会刷入到磁盘里去
+
+
+
+当然，绝对保证数据不丢，还得配置一个参数，提交事务把redo log刷入磁盘文件的os cache之后，还得强行从os cache刷入物理磁盘。redo log都会写入一个目录中的文件里，这个目录可以通过**show variables like 'datadir'**来查看，可以通过**innodb_log_group_home_dir**参数来设置这个目录的。
+
+redo log是有多个的，写满了一个就会写下一个redo log，而且可以限制redo log文件的数量，通过**innodb_log_file_size**可以指定每个redo log文件的大小，默认是**48MB**，通过**innodb_log_files_in_group**可以指定**日志文件的数量**，默认就2个。分别为ib_logfile0和ib_logfile1，每个48MB。如果第二个也写满了呢，继续写第一个，覆盖第一个日志文件里原来的redo log就可以了。
 
