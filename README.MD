@@ -1,7 +1,3 @@
-
-
-
-
 # MySQL实战高手
 
 
@@ -1138,3 +1134,180 @@ MySQL内有另外一个数据结构，叫做**redo log block**，大概你可以
 
 redo log是有多个的，写满了一个就会写下一个redo log，而且可以限制redo log文件的数量，通过**innodb_log_file_size**可以指定每个redo log文件的大小，默认是**48MB**，通过**innodb_log_files_in_group**可以指定**日志文件的数量**，默认就2个。分别为ib_logfile0和ib_logfile1，每个48MB。如果第二个也写满了呢，继续写第一个，覆盖第一个日志文件里原来的redo log就可以了。
 
+
+
+## 11. Undo 日志
+
+执行事务的时候，才必须引入另外一种日志，就是undo log回滚日志
+
+![](./images/mysql-48.png)
+
+
+
++ 比如你要是在缓存页里执行了一个insert语句，那么此时你在undo log日志里，对这个操作记录的回滚日志就必须是有一个主键和一个对应的delete操作，要能让你把这次insert操作给回退了。
++ 比如说你要是执行的是delete语句，那么起码你要把你删除的那条数据记录下来，如果要回滚，就应该执行一个insert操作把那条数据插入回去。
++ 如果你要是执行的是update语句，那么起码你要把你更新之前的那个值记录下来，回滚的时候重新update一下，把你之前更新前的旧值给他更新回去。
++ **select**语句压根儿没有在buffer pool里执行任何修改，**所以根本不需要undo log**！
+
+![](./images/mysql-49.png)
+
+**INSERT语句的undo log的类型是TRX_UNDO_INSERT_REC**，这个undo log里包含了以下一些东西：
+
+- 这条日志的开始位置
+- 主键的各列长度和值：如果你自己指定了一个主键，那么可能这个主键就是一个列，比如id之类的，也可能是多个列组成的一个主键
+- 表id
+- undo log日志编号
+- undo log日志类型：TRX_UNDO_INSERT_REC
+- 这条日志的结束位置
+
+
+
+## 12. 事务
+
+### 12.1 事务中并发读写问题
+
+#### 脏写
+
+这个脏写的话，他的意思就是说有两个事务，事务A和事务B同时在更新一条数据，事务A先把他更新为A值，事务B紧接着就把他更新为B值，如下图所示
+
+![](./images/mysql-50.png)
+
+而且此时事务A更新之后会记录一条undo log日志，大家应该还记得吧。事务A是先更新的，他在更新之前，这行数据的值为NULL，对吧。所以此时事务A的undo log日志大概就是：更新之前这行数据的值为NULL，主键为XX。那么此时事务B更新完了数据的值为B，结果此时事务A突然回滚了，那么就会用他的undo log日志去回滚。
+
+![](./images/mysql-51.png)
+
+事务B一看，为什么我更新的B值没了？就因为你事务A反悔了就把数据值回滚成NULL了，更新的B值也没了！所以对于事务B看到的场景，就是自己明明更新了，结果值却没了，**这就是脏写**
+
+
+
+#### 脏读
+
+假设事务A更新了一行数据的值为A值，此时事务B去查询了一下这行数据的值，看到的值是不是A值？没错，此时如下图所示。
+
+![](./images/mysql-52.png)
+
+事务B可能还挺high的，拿着刚才查询到的A值做各种业务处理。大家知道，每个事务都是业务系统发出的，所以业务系统里的事务B此时肯定会拿到刚查出来的A值在做一些业务处理。
+
+**事务A突然回滚了事务，导致他刚才更新的A值没了**，此时那行数据的值回滚为NULL值！
+
+![](./images/mysql-53.png)
+
+事务B去查询了事务A修改过的数据，但是此时事务A还没提交，所以事务A随时会回滚导致事务B再次查询就读不到刚才事务A修改的数据了！这就是脏读。
+
+
+
+#### 不可重复读
+
+假设缓存页里一条数据原来的值是A值，此时事务A开启之后，第一次查询这条数据，读取到的就是A值，如下图所示。
+
+![](./images/mysql-54.png)
+
+在事务执行期间第二次查询数据，此时查到的是事务B修改过的值，B值，因为事务B已经提交了，所以事务A可以读到的了
+
+![](./images/mysql-55.png)
+
+紧接着事务C再次更新数据为C值，并且提交事务了，此时事务A在没提交的情况下，第三次查询数据，查到的值为C值
+
+![](./images/mysql-56.png)
+
+如果多次查询数据，都是同样的一个A值，他希望这个A值是他重复读取的时候一直可以读到的！他希望这行数据的值是可重复读的！
+
+
+
+#### 幻读
+
+你一个事务A，先发送一条SQL语句，里面有一个条件，要查询一批数据出来，比如“select * from table where id>10”，类似这种SQL。一开始查询出来了10条数据
+
+![](./images/mysql-57.png)
+
+别的事务B往表里插入了几条数据，而且事务B还提交了，此时A再次按照之前的一模一样的条件执行“select * from table where id>10”这条SQL语句，由于其他事务插入了几条数据，导致这次他查询出来了12条数据
+
+![](./images/mysql-58.png)
+
+于是此时事务A开始怀疑自己的双眼了，为什么一模一样的SQL语句，第一次查询是10条数据，第二次查询是12条数据。幻读指的就是你一个事务用一样的SQL多次查询，结果每次查询都会发现查到了一些之前没看到过的数据。
+
+
+
+### 12.2 事务的隔离级别
+
+**read uncommitted（读未提交），read committed（读已提交），repeatable read（可重复读），serializable（串行化）**
+
++ read uncommitted隔离级别，是不允许发生脏写的
++ read committed隔离级别，这个级别下，不会发生脏写和脏读。在别的事务已经提交之后读到他们修改过的值就可以了，但是别的事务没提交的时候，绝对不会读到人家修改的值。
++ repeatale read隔离级别，就是可重复读级别，不会发生脏写、脏读和不可重复读的问题，一旦开始，多次查询一个值，会一直读到同一个值！
++ serializable隔离级别，根本就不允许你多个事务并发执行，只能串行起来执行
+
+假设你要修改MySQL的默认事务隔离级别，是下面的命令，可以设置级别为不同的level，level的值可以是REPEATABLE READ，READ COMMITTED，READ UNCOMMITTED，SERIALIZABLE几种级别。
+
+```SQL
+SET [GLOBAL|SESSION] TRANSACTION ISOLATION LEVEL level;
+```
+
+
+
+用Spring里的@Transactional注解来做事务这块, 可以手动改成Isolation.READ_UNCOMMITTED级别，也可以改成Isolation.READ_COMMITTED，Isolation.REPEATABLE_READ，Isolation.SERIALIZABLE几个级别，都是可以的。
+
+默认的就是DEFAULT值，这个就是MySQL默认支持什么隔离级别就是什么隔离级别，**MySQL默认是RR级别**
+
+```java
+@Transactional(isolation=Isolation.DEFAULT)
+```
+
+
+
+### 12.3 MVCC机制
+
+**MVCC多版本并发控制机制**控制隔离级别
+
+#### undo log 版本链
+
+每条数据其实都有两个隐藏字段，一个是trx_id，一个是roll_pointer，这个trx_id就是最近一次更新这条数据的事务id，roll_pointer就是指向你了你更新这个事务之前生成的undo log
+
+在假设有一个事务A（id=50），插入了一条数据，那么此时这条数据的隐藏字段以及指向的undo log如下图所示，插入的这条数据的值是值A，因为事务A的id是50，所以这条数据的txr_id就是50，roll_pointer指向一个空的undo log，因为之前这条数据是没有的
+
+![](./images/mysql-60.png)
+
+接着假设有一个事务B跑来修改了一下这条数据，把值改成了值B，事务B的id是58，那么此时更新之前会生成一个undo log记录之前的值，然后会让roll_pointer指向这个实际的undo log回滚日志
+
+![](./images/mysql-61.png)
+
+事务C又来修改了一下这个值为值C，他的事务id是69，此时会把数据行里的txr_id改成69，然后生成一条undo log，记录之前事务B修改的那个值
+
+![](./images/mysql-62.png)
+
+数据行里的值变成了值C，txr_id是事务C的id，也就是69，然后roll_pointer指向了本次修改之前生成的undo log，也就是记录了事务B修改的那个值，包括事务B的id，同时事务B修改的那个undo log还串联了最早事务A插入的那个undo log
+
+
+
+#### ReadView 机制
+
+在执行一个事务的时候，就会生产一个ReadView
+
++ m_ids: 这个是哪些事务在执行还没有提交
++ min_trx_id：m_ids的最小值
++ max_trx_id：最大的事务id
++ creator_trx_id: 当前事务的id
+
+两个事务并发执行，事务A(id=45), 事务B(id=59), 事务B要去更新，事务A去读取。事务A开启一个ReadView, min_trx_id 就是45， max_trx_Id就是60， createor_trx_id就是45
+
+![](./images/mysql-63.png)
+
+事务A去查询，当前数据trx_id小于ReadView中的min_trx_id, trx_id是32，小于min_trx_id就是45，说明事务开启之前，修改这行事务的数据已经提交
+
+事务B把这行数据修改为B，然后把这行数据的trx_id设置为59，同时roll_pointer指向修改之前生产的undo log，接着提交事务B
+
+![](./images/mysql-64.png)
+
+事务A再次查询，发现数据行的trx_id是59，大于min_trx_id(45) 同时小于 max_trx_id(60)。说明更新这条数据的事务，可能差不多和自己同时开启。查看是否在m_ids列表里面，果然列表里面有45和59两个事务id。
+
+![](./images/mysql-65.png)
+
+顺着这条数据的roll_pointer，顺着undo log日志链往下找，最近一条undo log，trx_id是32，小于ReadView里面min_trx_id(45)， 说明在事务A之前提交
+
+![](./images/mysql-68.png)
+
+接着事务A修改了值，trx_id改为45，事务A再次查询，发现trx_Id 和 creator_trx_id 一样。可以查询
+
+![](./images/mysql-69.png)
+
+突然开启一个事务C，事务id是78，修改数据值为C，A再次去查询，发现trx_id是78，大于max_trx_id(60)，自己不应该看到，就顺着undo log版本链往下走，知道读取到trx_id是45
