@@ -2081,9 +2081,8 @@ id | select_type | table | partitions | type | possible_keys | key  | key_len | 
 但是如果你的SQL语句极为的复杂，可能这⾥会有很多条数据，因为⼀个复杂的SQL语句的执⾏是要拆分为很多步骤的，⽐如先
 访问表A，接着搞⼀个排序，然后来⼀个分组聚合，再访问表B，接着搞⼀个连接，类似这样⼦。
 
-+ id呢，就是说每个SELECT都会对应⼀个id，其实说穿了，就是⼀个复杂的SQL⾥可能会有很多个SELECT，也可能会包含多
-  条执⾏计划，每⼀条执⾏计划都会有⼀个唯⼀的id
-
++ id呢，就是说每个SELECT都会对应⼀个id，就是⼀个复杂的SQL⾥可能会有很多个SELECT，也可能会包含多条执⾏计划，每⼀条执⾏计划都会有⼀个唯⼀的id
+  
 + select_type，顾名思义，说的就是这⼀条执⾏计划对应的查询是个什么查询类型
 + table就是表名，意思是要查询哪个表，
 + partitions是表分区的概念，这个所谓的分区表我们会在后⾯给⼤家讲，这⾥先不⽤太关注他。
@@ -2482,7 +2481,7 @@ NULL     | NULL | 5788 |   100.00 | Using temporary |
 现在我们来对运营系统筛选⽤户的SQL做⼀个简化，写出来给⼤家看个热闹，这个SQL经过简化看起来可能是这样的：
 
 ```SQL
-SELECT id, name FROM users WHERE id IN (SELECT user_id FROM users_extent_info  WHERE latest_login_time < xxxxx)
+SELECT COUNT(id) FROM users WHERE id IN (SELECT user_id FROM users_extent_info WHERE latest_login_time< xxxxx)
 ```
 
 ⼀般存储⽤户数据的表会分为两张表，⼀个表⽤来存储⽤户的核⼼数据，⽐如id、name、昵称、⼿机号之类的信息，也就是上⾯SQL语句⾥的users表, 另外⼀个表可能会存储⽤户的⼀些拓展信息，⽐如说家庭住址、兴趣爱好、最近⼀次登录时间之类的，就是上⾯ users_extent_info表
@@ -2496,7 +2495,7 @@ SELECT id, name FROM users WHERE id IN (SELECT user_id FROM users_extent_info  W
 执⾏计划，但是没关系，⼤家重点学的是执⾏计划分析的思路，以及如何从执⾏计划⾥看出性能问题所在，最后就是如何进⾏调
 优，重点是这个过程，没法还原出来执⾏计划，也是没关系的。
 
-即使是5万条数据，当时这个SQL都跑了⼗多秒，所以⾜够复现当时的⽣产问题了，所以⼤家注意下执⾏计划⾥的数据量问题。
+**即使是5万条数据，当时这个SQL都跑了⼗多秒**，所以⾜够复现当时的⽣产问题了，所以⼤家注意下执⾏计划⾥的数据量问题。
 
 ```SQL
 EXPLAIN SELECT COUNT(id) FROM users WHERE id IN (SELECT user_id FROM 
@@ -2533,3 +2532,30 @@ users_extent_info WHERE latest_login_time< xxxxx)
 
 + 第⼆条执⾏计划的全表扫描的结果表明是⼀共扫到了49651条数据，但是全表扫描的过程中，**因为去跟物化临时表执⾏了⼀个join**
   **操作，⽽物化临时表⾥就4561条数据**，所以最终第⼆条执⾏计划的ﬁltered显示的是10%，也就是说，最终从users表⾥筛选出了返回也是4000多条数据。                                                                     
+
+### 优化
+
+执⾏完上述SQL的EXPLAIN命令，看到执⾏计划之后，可以执⾏⼀下show warnings命令。这个show warnings命令此时显示出来的内容如下：
+
+```SQL
+/* select#1 */ select count(`d2.`users`.`user_id``) AS `COUNT(users.user_id)` from `d2`.`users` `users` semi join xxxxxx
+```
+
+关注的应该是这⾥的semi join这个关键字，⾃动就把⼀个普通的IN⼦句，“优化”成了基于semi join来进⾏IN+⼦查询的操作。
+
+简单来说，对users表全表扫描，对users表⾥每⼀条数据，去对物化临时表全表扫描做semi join。**只要users表⾥的⼀条数据，在物化临时表⾥可以找到匹配的数据，那么users表⾥的数据就会返回**，这就叫做semi join，他是⽤来筛选的。
+
+
+
+做个⼩实验，执⾏SET optimizer_switch='semijoin=oﬀ'，也就是关闭掉半连接优化，此时执⾏EXPLAIN命令看⼀下此时的执⾏计划，发现此时会恢复为⼀个正常的状态。
+
+就是有⼀个SUBQUERY的⼦查询，基于range⽅式去扫描索引搜索出4561条数据，**接着有⼀个PRIMARY类型的主查询，直接是基**
+**于id这个PRIMARY主键聚簇索引去执⾏的搜索**，然后再把这个SQL语句真实跑⼀下看看，发现性能⼀下⼦提升了⼏⼗倍，变成了100多毫秒！因此到此为⽌，这个SQL的性能问题，反⽽是他⾃动执⾏的semi join半连接优化。
+
+```SQL
+SELECT COUNT(id) FROM users WHERE ( id IN (SELECT user_id FROM users_extent_info WHERE latest_login_time < 
+xxxxx) OR id IN (SELECT user_id FROM users_extent_info WHERE latest_login_time < -1))
+```
+
+**正常的⽤了⼦查询，主查询也是基于索引去执⾏的**，这样我们在线上上线了这个SQL语句，性能从⼏⼗秒⼀下⼦就变成⼏百毫秒了。
+
